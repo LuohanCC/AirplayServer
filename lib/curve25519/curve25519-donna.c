@@ -847,6 +847,11 @@ curve25519_donna(u8 *mypublic, const u8 *secret, const u8 *basepoint) {
   int i;
 
   for (i = 0; i < 32; ++i) e[i] = secret[i];
+  /*
+   1111 1000
+   0111 1111
+   0100 0000
+   */
   e[0] &= 248;
   e[31] &= 127;
   e[31] |= 64;
