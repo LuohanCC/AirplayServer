@@ -74,6 +74,10 @@ struct raop_rtp_mirror_s {
     // client ntp port
     unsigned short mirror_timing_rport;
     unsigned short mirror_timing_lport;
+
+    /* 复制spspps */
+    int sps_pps_len;
+    unsigned char *sps_pps;
 };
 
 static int
@@ -132,7 +136,7 @@ raop_rtp_mirror_t *raop_rtp_mirror_init(logger_t *logger, raop_callbacks_t *call
     raop_rtp_mirror->running = 0;
     raop_rtp_mirror->joined = 1;
     raop_rtp_mirror->flush = NO_FLUSH;
-
+    raop_rtp_mirror->sps_pps = NULL;
     MUTEX_CREATE(raop_rtp_mirror->run_mutex);
     MUTEX_CREATE(raop_rtp_mirror->time_mutex);
     COND_CREATE(raop_rtp_mirror->time_cond);
@@ -369,7 +373,16 @@ raop_rtp_mirror_thread(void *arg)
                     pts =  ntptopts(payloadntp);
                     /* 这里是加密的数据 */
                     unsigned char* payload_in = malloc(payloadsize);
+                    if (!payload_in) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc payload_in error");
+                        break;
+                    }
                     unsigned char* payload = malloc(payloadsize);
+                    if (!payload) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc payload error");
+                        free(payload_in);
+                        break;
+                    }
                     readstart = 0;
                     do {
                         /* payload数据 */
@@ -404,12 +417,29 @@ raop_rtp_mirror_thread(void *arg)
 #ifdef DUMP_H264
                     fwrite(payload, payloadsize, 1, file);
 #endif
-                    h264_decode_struct h264_data;
-                    h264_data.data_len = payloadsize;
-                    h264_data.data = payload;
-                    h264_data.frame_type = payload[4] & 0x1f;
-                    h264_data.pts = pts;
-                    raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
+                    if (raop_rtp_mirror->sps_pps_len != 0) {
+                        h264_decode_struct h264_data;
+                        h264_data.frame_type = payload[4] & 0x1f;
+                        if (h264_data.frame_type == 5) {
+                            unsigned char* payload_out = malloc(payloadsize + raop_rtp_mirror->sps_pps_len);
+                            if (!payload_out) {
+                                logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc payload_out error");
+                                free(payload_in);
+                                free(payload);
+                                break;
+                            }
+                            memcpy(payload_out, raop_rtp_mirror->sps_pps, raop_rtp_mirror->sps_pps_len);
+                            memcpy(payload_out + raop_rtp_mirror->sps_pps_len, payload, payloadsize);
+                            h264_data.data = payload_out;
+                            h264_data.data_len = payloadsize + raop_rtp_mirror->sps_pps_len;
+                            free(payload);
+                        } else {
+                            h264_data.data = payload;
+                            h264_data.data_len = payloadsize;
+                        }
+                        h264_data.pts = pts;
+                        raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
+                    }
                     free(payload_in);
                 } else if ((payloadtype & 255) == 1) {
                     float width_source = byteutils_get_float(packet, 40);
@@ -430,6 +460,10 @@ raop_rtp_mirror_thread(void *arg)
 
                     /* sps_pps 这块数据是没有加密的 */
                     unsigned char *payload = malloc(payloadsize);
+                    if (!payload) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc payload error");
+                        break;
+                    }
                     readstart = 0;
                     do {
                         /* payload数据 */
@@ -454,32 +488,43 @@ raop_rtp_mirror_thread(void *arg)
                     memcpy(h264.picture_parameter_set, payload + h264.lengthofSPS + 11, h264.lengthofPPS);
                     if (h264.lengthofSPS + h264.lengthofPPS < 102400) {
                         /* 复制spspps */
-                        int sps_pps_len = (h264.lengthofSPS + h264.lengthofPPS) + 8;
-                        unsigned char *sps_pps = malloc(sps_pps_len);
-                        sps_pps[0] = 0;
-                        sps_pps[1] = 0;
-                        sps_pps[2] = 0;
-                        sps_pps[3] = 1;
-                        memcpy(sps_pps + 4, h264.sequence, h264.lengthofSPS);
-                        sps_pps[h264.lengthofSPS + 4] = 0;
-                        sps_pps[h264.lengthofSPS + 5] = 0;
-                        sps_pps[h264.lengthofSPS + 6] = 0;
-                        sps_pps[h264.lengthofSPS + 7] = 1;
-                        memcpy(sps_pps + h264.lengthofSPS + 8, h264.picture_parameter_set, h264.lengthofPPS);
+                        raop_rtp_mirror->sps_pps_len = (h264.lengthofSPS + h264.lengthofPPS) + 8;
+                        if (raop_rtp_mirror->sps_pps) {
+                            free(raop_rtp_mirror->sps_pps);
+                        }
+                        raop_rtp_mirror->sps_pps = malloc(raop_rtp_mirror->sps_pps_len);
+                        if (!raop_rtp_mirror->sps_pps) {
+                            logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc sps_pps error");
+                            break;
+                        }
+                        raop_rtp_mirror->sps_pps[0] = 0;
+                        raop_rtp_mirror->sps_pps[1] = 0;
+                        raop_rtp_mirror->sps_pps[2] = 0;
+                        raop_rtp_mirror->sps_pps[3] = 1;
+                        memcpy(raop_rtp_mirror->sps_pps + 4, h264.sequence, h264.lengthofSPS);
+                        raop_rtp_mirror->sps_pps[h264.lengthofSPS + 4] = 0;
+                        raop_rtp_mirror->sps_pps[h264.lengthofSPS + 5] = 0;
+                        raop_rtp_mirror->sps_pps[h264.lengthofSPS + 6] = 0;
+                        raop_rtp_mirror->sps_pps[h264.lengthofSPS + 7] = 1;
+                        memcpy(raop_rtp_mirror->sps_pps + h264.lengthofSPS + 8, h264.picture_parameter_set, h264.lengthofPPS);
 #ifdef DUMP_H264
                         fwrite(sps_pps, sps_pps_len, 1, file);
 #endif
-                        h264_decode_struct h264_data;
-                        h264_data.data_len = sps_pps_len;
-                        h264_data.data = sps_pps;
-                        h264_data.width = (int) width;
-                        h264_data.height = (int) height;
-                        h264_data.pts = 0;
-                        raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
+//                        h264_decode_struct h264_data;
+//                        h264_data.data_len = sps_pps_len;
+//                        h264_data.data = sps_pps;
+//                        h264_data.width = (int) width;
+//                        h264_data.height = (int) height;
+//                        h264_data.pts = 0;
+
+                        //free(sps_pps);
+                        /* 这里不回调 */
+                        //raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
                     }
                     free(h264.picture_parameter_set);
                     free(h264.sequence);
                     free(payload);
+
                 } else if (payloadtype == (short) 2) {
                     readstart = 0;
                     if (payloadsize > 0) {
@@ -620,6 +665,9 @@ void raop_rtp_mirror_destroy(raop_rtp_mirror_t *raop_rtp_mirror) {
         mirror_buffer_destroy(raop_rtp_mirror->buffer);
 	    raop_rtp_mirror->callbacks.video_destroy(raop_rtp_mirror->callbacks.cls);
 	    free(raop_rtp_mirror);
+	    if (raop_rtp_mirror->sps_pps) {
+	        free(raop_rtp_mirror->sps_pps);
+	    }
     }
 }
 
