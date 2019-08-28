@@ -127,10 +127,12 @@ raop_rtp_mirror_t *raop_rtp_mirror_init(logger_t *logger, raop_callbacks_t *call
     raop_rtp_mirror->buffer = mirror_buffer_init(logger, aeskey, ecdh_secret);
     if (!raop_rtp_mirror->buffer) {
         free(raop_rtp_mirror);
+		raop_rtp_mirror = NULL;
         return NULL;
     }
     if (raop_rtp_parse_remote(raop_rtp_mirror, remote, remotelen) < 0) {
         free(raop_rtp_mirror);
+		raop_rtp_mirror = NULL;
         return NULL;
     }
     raop_rtp_mirror->running = 0;
@@ -269,6 +271,8 @@ raop_rtp_mirror_thread(void *arg)
     unsigned int readstart = 0;
 //    uint64_t pts_base = 0;
     uint64_t pts = 0;
+	float width_source = 0;
+	float height_source = 0;
     assert(raop_rtp_mirror);
 
 #ifdef DUMP_H264
@@ -351,8 +355,20 @@ raop_rtp_mirror_thread(void *arg)
                 do {
                     /* 读取剩下的124字节 */
                     ret = recv(stream_fd, packet + readstart, 128 - readstart, 0);
+                    if (ret <= 0) {
+                        break;
+                    }
                     readstart = readstart + ret;
                 } while (readstart < 128);
+                if (ret == 0) {
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed");
+                    FD_CLR(stream_fd, &rfds);
+                    stream_fd = -1;
+                    continue;
+                } else if (ret == -1) {
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in recv");
+                    break;
+                }
                 int payloadsize = byteutils_get_int(packet, 0);
                 /* FIXME: 这里计算方式需要再确认 */
                 short payloadtype = (short) (byteutils_get_short(packet, 4) & 0xff);
@@ -377,18 +393,33 @@ raop_rtp_mirror_thread(void *arg)
                         logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc payload_in error");
                         break;
                     }
-                    unsigned char* payload = malloc(payloadsize);
-                    if (!payload) {
-                        logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc payload error");
-                        free(payload_in);
-                        break;
-                    }
                     readstart = 0;
                     do {
                         /* payload数据 */
                         ret = recv(stream_fd, payload_in + readstart, payloadsize - readstart, 0);
+                        if (ret <= 0) {
+                            free(payload_in);
+                            payload_in = NULL;
+                            break;
+                        }
                         readstart = readstart + ret;
                     } while (readstart < payloadsize);
+                    if (ret == 0) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed");
+                        FD_CLR(stream_fd, &rfds);
+                        stream_fd = -1;
+                        continue;
+                    } else if (ret == -1) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in recv");
+                        break;
+                    }
+                    unsigned char* payload = malloc(payloadsize);
+                    if (!payload) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc payload error");
+                        free(payload_in);
+                        payload_in = NULL;
+                        break;
+                    }
                     /*logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "readstart = %d", readstart); */
 #ifdef DUMP_H264
                     fwrite(payload_in, payloadsize, 1, file_source);
@@ -425,7 +456,9 @@ raop_rtp_mirror_thread(void *arg)
                             if (!payload_out) {
                                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "malloc payload_out error");
                                 free(payload_in);
+								payload_in = NULL;
                                 free(payload);
+								payload = NULL;
                                 break;
                             }
                             memcpy(payload_out, raop_rtp_mirror->sps_pps, raop_rtp_mirror->sps_pps_len);
@@ -433,17 +466,21 @@ raop_rtp_mirror_thread(void *arg)
                             h264_data.data = payload_out;
                             h264_data.data_len = payloadsize + raop_rtp_mirror->sps_pps_len;
                             free(payload);
+							payload = NULL;
                         } else {
                             h264_data.data = payload;
                             h264_data.data_len = payloadsize;
                         }
                         h264_data.pts = pts;
+						h264_data.width = width_source;
+						h264_data.height = height_source;
                         raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
                     }
                     free(payload_in);
+					payload_in = NULL;
                 } else if ((payloadtype & 255) == 1) {
-                    float width_source = byteutils_get_float(packet, 40);
-                    float height_source = byteutils_get_float(packet, 44);
+                    width_source = byteutils_get_float(packet, 40);
+                    height_source = byteutils_get_float(packet, 44);
                     float width = byteutils_get_float(packet, 56);
                     float height = byteutils_get_float(packet, 60);
                     logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "width_source = %f height_source = %f width = %f height = %f", width_source, height_source, width, height);
@@ -468,8 +505,21 @@ raop_rtp_mirror_thread(void *arg)
                     do {
                         /* payload数据 */
                         ret = recv(stream_fd, payload + readstart, payloadsize - readstart, 0);
+                        if (ret <= 0) {
+                            free(payload);
+                            break;
+                        }
                         readstart = readstart + ret;
                     } while (readstart < payloadsize);
+                    if (ret == 0) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed");
+                        FD_CLR(stream_fd, &rfds);
+                        stream_fd = -1;
+                        continue;
+                    } else if (ret == -1) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in recv");
+                        break;
+                    }
                     h264codec_t h264;
                     h264.version = payload[0];
                     h264.profile_high = payload[1];
@@ -491,6 +541,7 @@ raop_rtp_mirror_thread(void *arg)
                         raop_rtp_mirror->sps_pps_len = (h264.lengthofSPS + h264.lengthofPPS) + 8;
                         if (raop_rtp_mirror->sps_pps) {
                             free(raop_rtp_mirror->sps_pps);
+							raop_rtp_mirror->sps_pps = NULL;
                         }
                         raop_rtp_mirror->sps_pps = malloc(raop_rtp_mirror->sps_pps_len);
                         if (!raop_rtp_mirror->sps_pps) {
@@ -522,8 +573,11 @@ raop_rtp_mirror_thread(void *arg)
                         //raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
                     }
                     free(h264.picture_parameter_set);
+					h264.picture_parameter_set = NULL;
                     free(h264.sequence);
+					h264.sequence = NULL;
                     free(payload);
+					payload = NULL;
 
                 } else if (payloadtype == (short) 2) {
                     readstart = 0;
@@ -531,9 +585,22 @@ raop_rtp_mirror_thread(void *arg)
                         unsigned char* payload_in = malloc(payloadsize);
                         do {
                             ret = recv(stream_fd, payload_in + readstart, payloadsize - readstart, 0);
+                            if (ret <= 0) {
+                                break;
+                            }
                             readstart = readstart + ret;
                         } while (readstart < payloadsize);
                         free(payload_in);
+						payload_in = NULL;
+                        if (ret == 0) {
+                            logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed");
+                            FD_CLR(stream_fd, &rfds);
+                            stream_fd = -1;
+                            continue;
+                        } else if (ret == -1) {
+                            logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in recv");
+                            break;
+                        }
                     }
                 } else if (payloadtype == (short) 4) {
                     readstart = 0;
@@ -541,9 +608,22 @@ raop_rtp_mirror_thread(void *arg)
                         unsigned char* payload_in = malloc(payloadsize);
                         do {
                             ret = recv(stream_fd, payload_in + readstart, payloadsize - readstart, 0);
+                            if (ret <= 0) {
+                                break;
+                            }
                             readstart = readstart + ret;
                         } while (readstart < payloadsize);
                         free(payload_in);
+						payload_in = NULL;
+                        if (ret == 0) {
+                            logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed");
+                            FD_CLR(stream_fd, &rfds);
+                            stream_fd = -1;
+                            continue;
+                        } else if (ret == -1) {
+                            logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in recv");
+                            break;
+                        }
                     }
                 } else {
                     readstart = 0;
@@ -551,9 +631,22 @@ raop_rtp_mirror_thread(void *arg)
                         unsigned char* payload_in = malloc(payloadsize);
                         do {
                             ret = recv(stream_fd, payload_in + readstart, payloadsize - readstart, 0);
+                            if (ret <= 0) {
+                                break;
+                            }
                             readstart = readstart + ret;
                         } while (readstart < payloadsize);
                         free(payload_in);
+						payload_in = NULL;
+                        if (ret == 0) {
+                            logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed");
+                            FD_CLR(stream_fd, &rfds);
+                            stream_fd = -1;
+                            continue;
+                        } else if (ret == -1) {
+                            logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in recv");
+                            break;
+                        }
                     }
                 }
             }
@@ -664,10 +757,12 @@ void raop_rtp_mirror_destroy(raop_rtp_mirror_t *raop_rtp_mirror) {
         COND_DESTROY(raop_rtp_mirror->time_cond);
         mirror_buffer_destroy(raop_rtp_mirror->buffer);
 	    raop_rtp_mirror->callbacks.video_destroy(raop_rtp_mirror->callbacks.cls);
+		if (raop_rtp_mirror->sps_pps) {
+			free(raop_rtp_mirror->sps_pps);
+			raop_rtp_mirror->sps_pps = NULL;
+		}
 	    free(raop_rtp_mirror);
-	    if (raop_rtp_mirror->sps_pps) {
-	        free(raop_rtp_mirror->sps_pps);
-	    }
+		raop_rtp_mirror = NULL;
     }
 }
 
